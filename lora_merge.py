@@ -1,10 +1,22 @@
-import comfy
 import math
+from typing import Literal
+
 import torch
+
+import comfy
+from .lora_resize import resize_lora_model
+from .peft_utils import task_arithmetic, ties, dare_linear, dare_ties, magnitude_prune
 
 CLAMP_QUANTILE = 0.99
 
 class LoraMerger:
+    """
+       Class for merging LoRA models using various methods.
+
+       Attributes:
+           loaded_lora: A placeholder for the loaded LoRA model.
+    """
+
     def __init__(self):
         self.loaded_lora = None
 
@@ -12,179 +24,502 @@ class LoraMerger:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "lora_1": ("LoRA",),
-                "mode": (["add", "concat", "svd"], ),
-                "rank": ("INT", {
-                    "default": 16, 
-                    "min": 1, #Minimum value
-                    "max": 320, #Maximum value
-                    "step": 1, #Slider's step
-                    "display": "number" # Cosmetic only: display as "number" or "slider"
-                }),
-                "threshold": ("FLOAT", {
+                "lora1": ("LoRA",),
+                "mode": (["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"],),
+                "density": ("FLOAT", {
                     "default": 1.0,
                     "min": 0,
                     "max": 1,
                     "step": 0.01,
                 }),
-                "device": (["cuda", "cpu"], ),
-                "dtype": (["float32", "float16", "bfloat16"], ),
+                "device": (["cuda", "cpu"],),
+                "dtype": (["float32", "float16", "bfloat16"],),
             },
-            "optional": {
-                "lora_2": ("LoRA",),
-            }
         }
-    RETURN_TYPES = ("LoRA", )
+
+    RETURN_TYPES = ("LoRA",)
     FUNCTION = "lora_merge"
 
     CATEGORY = "lora_merge"
 
-    def lora_merge(self, lora_1, lora_2=None, mode=None, rank=None, threshold=None, device=None, dtype=None):
-        
-        lora = self.merge(lora_1, lora_2, mode, rank, threshold, device, dtype)
-
-        return (lora, )
-    
     @torch.no_grad()
-    def merge(self, lora_1, lora_2, mode, rank, threshold, device, dtype):
+    def lora_merge(self, lora1,
+                   mode: Literal["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"] = None,
+                   density=None, device=None, dtype=None, **kwargs):
+        """
+            Merge multiple LoRA models using the specified mode.
+
+            This method merges the given LoRA models according to the specified mode, such as 'add', 'ties',
+            'dare_linear', 'dare_ties', or 'magnitude_prune'. The merging process considers the up and down
+            projection matrices and their respective alpha values.
+
+            Args:
+                lora1 (dict): The first LoRA model to merge.
+                mode (str, optional): The merging mode to use. Options include 'add', 'ties', 'dare_linear',
+                    'dare_ties', and 'magnitude_prune'. Default is None.
+                density (float, optional): The density parameter used for some merging modes.
+                device (torch.DeviceObjType, optional): The device to use for computations (e.g., 'cuda' or 'cpu').
+                dtype (torch.dtype, optional): The data type to use for computations (e.g., 'float32', 'float16', 'bfloat16').
+                **kwargs: Additional LoRA models to merge.
+
+            Returns:
+                tuple: A tuple containing the merged LoRA model.
+
+            Note:
+                - The method ensures that all tensors are moved to the specified device and cast to the specified data type.
+                - The merging process involves calculating task weights, scaling with alpha values, and combining
+                  up and down projection matrices based on the chosen mode.
+        """
+        loras = [lora1]
+        for k, v in kwargs.items():
+            loras.append(v)
+
+        self.validate_input(loras)
+
+        dtype = self.to_dtype(dtype)
+        keys = analyse_keys(loras)
+        weight = {}
+
         # lora = up @ down * alpha / rank
+        pbar = comfy.utils.ProgressBar(len(keys))
+        for key in keys:
+            # Build taskTensor weights
+            scale_key = "strength_clip" if "lora_te" in key else "strength_model"
+            weights = torch.tensor([w[scale_key] for w in loras]).to(device, dtype=dtype)
+
+            # Calculate up and down nets and their alphas
+            ups_downs_alphas = calc_up_down_alphas(loras, key)
+
+            # Scale weights with alpha values
+            ups_downs_alphas, alpha_1 = scale_alphas(ups_downs_alphas)
+
+            # Assure that dimensions are equal in every tensor of the same layer
+            ups_downs_alphas = curate_tensors(ups_downs_alphas)
+
+            up_tensors = [up.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
+            down_tensors = [down.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
+
+            if mode == "add":
+                up, down = (task_arithmetic(up_tensors, weights),
+                            task_arithmetic(down_tensors, weights))
+            elif mode == "ties":
+                up, down = (ties(up_tensors, weights, density),
+                            ties(down_tensors, weights, density))
+            elif mode == "dare_linear":
+                up, down = (dare_linear(up_tensors, weights, density),
+                            dare_linear(down_tensors, weights, density))
+            elif mode == "dare_ties":
+                up, down = (dare_ties(up_tensors, weights, density),
+                            dare_ties(down_tensors, weights, density))
+            else:  # mode == "magnitude_prune_svd":
+                up, down = (magnitude_prune(up_tensors, weights, density),
+                            magnitude_prune(down_tensors, weights, density))
+
+            weight[key + ".lora_up.weight"] = up.to('cpu', dtype=torch.float32)
+            weight[key + ".lora_down.weight"] = down.to('cpu', dtype=torch.float32)
+            weight[key + ".alpha"] = alpha_1.to('cpu', dtype=torch.float32)
+
+            pbar.update(1)
+
+        lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1}
+        return (lora_out,)
+
+    def to_dtype(self, dtype):
+        dtype_mapping = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16
+        }
+        dtype = dtype_mapping.get(dtype, torch.float32)
+        return dtype
+
+    def validate_input(self, loras):
+        dims = [find_network_dim(lora['lora']) for lora in loras]
+        if min(dims) != max(dims):
+            raise Exception("LoRAs with different ranks not allowed in LoraMerger. Use SVD merge.")
+
+
+class LoraSVDMerger:
+    """
+        Class for merging LoRA models using Singular Value Decomposition (SVD).
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "lora1": ("LoRA",),
+                "mode": (["add_svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"],),
+                "density": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01,
+                }),
+                "svd_rank": ("INT", {
+                    "default": 16,
+                    "min": 1,  # Minimum value
+                    "max": 320,  # Maximum value
+                    "step": 1,  # Slider's step
+                    "display": "number"  # Cosmetic only: display as "number" or "slider"
+                }),
+                "svd_conv_rank": ("INT", {
+                    "default": 1,
+                    "min": 0,
+                    "max": 320,
+                    "step": 1,
+                    "display": "number"
+                }),
+                "device": (["cuda", "cpu"],),
+            },
+        }
+
+    RETURN_TYPES = ("LoRA",)
+    FUNCTION = "lora_svd_merge"
+
+    CATEGORY = "lora_merge"
+
+    def lora_svd_merge(self, lora1,
+                       mode: Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"] = "add_svd",
+                       density: float = None, svd_rank: int = None, svd_conv_rank: int = None, device=None, **kwargs):
+        """
+           Merge LoRA models using SVD and specified mode.
+
+           Args:
+               lora1: The first LoRA model.
+               mode: The merging mode to use.
+               density: The density parameter for some merging modes.
+               svd_rank: The rank for SVD.
+               svd_conv_rank: The convolution rank for SVD.
+               device: The device to use ('cuda' or 'cpu').
+               **kwargs: Additional LoRA models to merge.
+
+           Returns:
+               A tuple containing the merged LoRA model.
+        """
+        loras = [lora1]
+        for k, v in kwargs.items():
+            loras.append(v)
 
         weight = {}
-        dtype = torch.float32 if dtype == "float32" else torch.float16 if dtype == "float16" else torch.bfloat16
+        keys = analyse_keys(loras)
 
-        if lora_2 is None:
-            lora_2 = {"lora":{}, "strength_model":0, "strength_clip":0}
-
-        keys_1 = [key[: key.rfind(".lora_down")] for key in lora_1["lora"].keys() if ".lora_down" in key]
-        keys_2 = [key[: key.rfind(".lora_down")] for key in lora_2["lora"].keys() if ".lora_down" in key]
-        keys = list(set(keys_1 + keys_2))
-        print(f"Merging {len(keys)} modules")
-        print(f"{len(keys)-len(keys_1)} modules only in lora_1")
-        print(f"{len(keys)-len(keys_2)} modules only in lora_2")
-        pber = comfy.utils.ProgressBar(len(keys))
-
+        pb = comfy.utils.ProgressBar(len(keys))
         for key in keys:
-            if key not in keys_1:
-                up, down, alpha = calc_up_down_alpha(key, lora_2)
-                if mode == "svd":
-                    up, down = svd_merge(up, down, None, None, rank, threshold, device)
-            elif key not in keys_2:
-                up, down, alpha = calc_up_down_alpha(key, lora_1)
-                if mode == "svd":
-                    up, down = svd_merge(up, down, None, None, rank, threshold, device)
+            # Build taskTensor weights
+            strength_key = "strength_clip" if "lora_te" in key else "strength_model"
+            strengths = torch.tensor([w[strength_key] for w in loras]).to(device)
+
+            # Calculate up and down nets and their alphas
+            ups_downs_alphas = calc_up_down_alphas(loras, key)
+
+            # Build merged tensor
+            weights = self.build_weights(ups_downs_alphas, strengths, mode, density, device)
+
+            # Calculate final tensors by svd
+            up, down, alpha = self.svd(weights, svd_rank, svd_conv_rank, device)
+
+            weight[key + ".lora_up.weight"] = up.to('cpu', dtype=torch.float32)
+            weight[key + ".lora_down.weight"] = down.to('cpu', dtype=torch.float32)
+            weight[key + ".alpha"] = alpha.to('cpu', dtype=torch.float32)
+
+            pb.update(1)
+
+        lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1}
+        return (lora_out,)
+
+    def build_weights(self, ups_downs_alphas, strengths,
+                      mode: Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"], density, device):
+        """
+            Construct the combined weight tensor from multiple LoRA up and down tensors using different
+            merging modes.
+
+            This method supports both fully connected (2D) and convolutional (4D) tensors. It scales and
+            merges the up and down tensors based on the specified mode and density, performing task-specific
+            arithmetic operations.
+
+            Args:
+                ups_downs_alphas (List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]): A list of tuples,
+                    where each tuple contains the up tensor, down tensor, and alpha value.
+                strengths (torch.Tensor): A tensor containing the strength values for each set of up and down tensors.
+                mode (Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"]):
+                    The mode to use for merging the weights. Each mode applies a different method of combining the tensors.
+                density (float): The density parameter used in certain modes like "ties" and "dare".
+                device (torch.DeviceObjType): The device on which to perform the computations (e.g., 'cuda' or 'cpu').
+
+            Returns:
+                torch.Tensor: The combined weight tensor resulting from the specified merging process.
+
+            Note:
+                - For convolutional tensors, special handling is applied depending on the kernel size.
+                - The weight tensors are scaled by their respective alpha values and normalized by their rank.
+        """
+        up_1, down_1, alpha_1 = ups_downs_alphas[0]
+        conv2d = len(down_1.size()) == 4
+        kernel_size = None if not conv2d else down_1.size()[2:4]
+
+        # lora = up @ down * alpha / rank
+        weights = []
+        for up, down, alpha in ups_downs_alphas:
+            up, down, alpha = up.to(device), down.to(device), alpha.to(device)
+            rank = up.shape[1]
+            if conv2d:
+                if kernel_size == (1, 1):
+                    weight = (up.squeeze(3).squeeze(2) @ down.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3) * alpha / rank
+                else:
+                    weight = torch.nn.functional.conv2d(down.permute(1, 0, 2, 3), up).permute(1, 0, 2, 3) * alpha / rank
+            else:  # linear
+                weight = up.view(-1, rank) @ down.view(rank, -1) * alpha / rank
+            weights.append(weight)
+
+        if mode == "add_svd":
+            weight = task_arithmetic(weights, strengths)
+        elif mode == "ties_svd":
+            weight = ties(weights, strengths, density)
+        elif mode == "dare_linear_svd":
+            weight = dare_linear(weights, strengths, density)
+        elif mode == "dare_ties_svd":
+            weight = dare_ties(weights, strengths, density)
+        else:  # mode == "magnitude_prune_svd":
+            weight = magnitude_prune(weights, strengths, density)
+
+        return weight
+
+
+    def svd(self, weights: torch.Tensor, svd_rank: int, svd_conv_rank: int, device: torch.DeviceObjType):
+        """
+            Perform Singular Value Decomposition (SVD) on the given weights tensor and return the
+            decomposed matrices with the specified ranks.
+
+            This method supports both 2D (fully connected) and 4D (convolutional) weight tensors. For
+            convolutional tensors, it handles both 1x1 and other kernel sizes. The ranks for decomposition
+            are adjusted based on the input tensor's dimensions and the specified rank constraints.
+
+            Args:
+                weights (torch.Tensor): The input weight tensor to decompose. Should be either a 2D or 4D tensor.
+                svd_rank (int): The rank for SVD decomposition for fully connected layers.
+                svd_conv_rank (int): The rank for SVD decomposition for convolutional layers with kernel sizes other than 1x1.
+                device (torch.DeviceObjType): The device on which to perform the computations (e.g., 'cuda' or 'cpu').
+
+            Returns:
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
+                    - up_weight: The U matrix after SVD decomposition, representing the left singular vectors.
+                    - down_weight: The Vh matrix after SVD decomposition, representing the right singular vectors.
+                    - module_new_rank: A tensor containing the new rank used for the decomposition.
+
+            Note:
+                SVD only supports float32 data type, so the input weights tensor is converted to float32 if necessary.
+        """
+        weights = weights.to(dtype=torch.float32, device=device)  # SVD only supports float32
+
+        conv2d = len(weights.size()) == 4
+        kernel_size = None if not conv2d else weights.size()[2:4]
+        conv2d_3x3 = conv2d and kernel_size != (1, 1)
+        out_dim, in_dim = weights.size()[0:2]
+
+        if conv2d:
+            if conv2d_3x3:
+                weights = weights.flatten(start_dim=1)
             else:
-                up_1, down_1, alpha_1 = calc_up_down_alpha(key, lora_1, add=mode!="add")
-                up_2, down_2, alpha_2 = calc_up_down_alpha(key, lora_2, add=mode!="add")
+                weights = weights.squeeze()
 
-                alpha = alpha_1
-                
-                # Scale to match alpha_1
-                up_2 = up_2 * math.sqrt(alpha_2/alpha) 
-                down_2 = down_2 * math.sqrt(alpha_2/alpha)
+        module_new_rank = svd_conv_rank if conv2d_3x3 else svd_rank
+        module_new_rank = min(module_new_rank, in_dim, out_dim)  # LoRA rank cannot exceed the original dim
 
-                up_1 = up_1.to(dtype=dtype)
-                down_1 = down_1.to(dtype=dtype)
-                up_2 = up_2.to(dtype=dtype)
-                down_2 = down_2.to(dtype=dtype)
+        U, S, Vh = torch.linalg.svd(weights)
 
-                # linear to conv 1x1 if needed
-                if up_1.dim() != up_2.dim():
-                    up_2 = up_2.unsqueeze(2).unsqueeze(3) 
-                    down_2 = down_2.unsqueeze(2).unsqueeze(3) 
+        U = U[:, :module_new_rank]
+        S = S[:module_new_rank]
+        U = U @ torch.diag(S)
 
-                if mode == "add":
-                    up = up_1 + up_2
-                    down = down_1 + down_2
-                elif mode == "concat":
-                    r_1 = up_1.shape[1]
-                    r_2 = up_2.shape[1]
-                    scale_1 = math.sqrt((r_1+r_2)/r_1)
-                    scale_2 = math.sqrt((r_1+r_2)/r_2)
-                    up = torch.cat([up_1*scale_1, up_2*scale_2], dim=1)
-                    down = torch.cat([down_1*scale_1, down_2*scale_2], dim=0)
-                elif mode == "svd":
-                    up, down = svd_merge(up_1, down_1, up_2, down_2, rank, threshold, device)
-                
-            weight[key + ".lora_up.weight"] = up
-            weight[key + ".lora_down.weight"] = down
-            weight[key + ".alpha"] = alpha
+        Vh = Vh[:module_new_rank, :]
 
-            pber.update(1)
-        
-        return {"lora":weight, "strength_model":1, "strength_clip":1}
-    
+        dist = torch.cat([U.flatten(), Vh.flatten()])
+        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+        low_val = -hi_val
+
+        U = U.clamp(low_val, hi_val)
+        Vh = Vh.clamp(low_val, hi_val)
+
+        if conv2d:
+            U = U.reshape(out_dim, module_new_rank, 1, 1)
+            Vh = Vh.reshape(module_new_rank, in_dim, kernel_size[0], kernel_size[1])
+
+        up_weight = U
+        down_weight = Vh
+
+        return up_weight, down_weight, torch.tensor(module_new_rank)
+
+
+class LoraResizer:
+    def __init__(self):
+        self.loaded_lora = None
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "lora": ("LoRA",),
+                "new_rank": ("INT", {
+                    "default": 16,
+                    "min": 1,  # Minimum value
+                    "max": 320,  # Maximum value
+                    "step": 1,  # Slider's step
+                    "display": "number"  # Cosmetic only: display as "number" or "slider"
+                }),
+                "device": (["cuda", "cpu"],),
+                "dtype": (["float32", "float16", "bfloat16"],),
+            },
+        }
+
+    RETURN_TYPES = ("LoRA",)
+    FUNCTION = "lora_svd_resize"
+    CATEGORY = "lora_merge"
+
+    def lora_svd_resize(self, lora, new_rank=None, device=None, dtype=None):
+        """
+            Resize the given LoRA model to a new rank using Singular Value Decomposition (SVD).
+
+            This method adjusts the rank of the LoRA model's state dictionary by performing an SVD-based
+            resizing operation. If the current rank matches the new rank, no resizing is performed.
+            The method ensures all computations are done in `float32` to avoid precision issues.
+
+            Args:
+                lora (dict): A dictionary containing the LoRA model. The model's state dictionary should
+                    be accessible via the 'lora' key.
+                new_rank (int, optional): The desired new rank for the LoRA model. If `None`, no resizing
+                    will occur unless the current rank is different from `new_rank`.
+                device (torch.DeviceObjType, optional): The device on which to perform the computations
+                    (e.g., 'cuda' or 'cpu'). If `None`, the default device will be used.
+                dtype (torch.dtype, optional): The data type for the resized tensor. If `None`, the
+                    original data type will be retained.
+
+            Returns:
+                tuple: A tuple containing the resized LoRA model.
+
+            Note:
+                - The method internally converts tensors to `float32` for the resizing process, ensuring
+                  compatibility with the SVD operation.
+                - The resizing is skipped if the current rank matches the specified `new_rank`.
+        """
+        state_dict = lora['lora']
+        if find_network_dim(state_dict) != new_rank:
+            for key, value in state_dict.items():
+                state_dict[key] = value.to(dtype=torch.float32)  # Resize only doesn't work in half mode
+            resized, _, _ = resize_lora_model(lora_sd=state_dict, new_rank=new_rank, save_dtype=dtype, device=device,
+                                              dynamic_method=None, dynamic_param=None, verbose=False)
+            state_dict = resized
+        lora['lora'] = state_dict
+        return (lora,)
+
+
 @torch.no_grad()
-def calc_up_down_alpha(key, lora, add=True):
+def calc_up_down_alphas(loras, key):
+    """
+       Calculate up, down tensors and alphas for a given key.
+
+       Args:
+           loras: List of LoRA models.
+           key: The key to calculate values for.
+
+       Returns:
+           List of tuples containing up, down tensors and alpha values.
+    """
+
     up_key = key + ".lora_up.weight"
     down_key = key + ".lora_down.weight"
     alpha_key = key + ".alpha"
 
-    is_te = "lora_te" in key
+    # Find loras with the respective key
+    owners = [l for l in loras if down_key in l['lora']]
+    up_shape = min([d['lora'][up_key].shape for d in owners])
+    down_shape = min([d['lora'][down_key].shape for d in owners])
 
-    scale = lora["strength_clip"] if is_te else lora["strength_model"]
-    sqrt_scale = math.sqrt(abs(scale)) if add else abs(scale) 
-    sign_scale = -1 if scale < 0 else 1
+    # Determine alpha from the first lora which contains the module
+    alpha_1 = owners[0]["lora"][alpha_key]
 
-    up = lora["lora"][up_key] * sqrt_scale * sign_scale
-    down = lora["lora"][down_key] * sqrt_scale
-    alpha = lora["lora"][alpha_key]
+    out = []
+    for lora in loras:
+        if lora in owners:
+            up, down, alpha = lora["lora"][up_key], lora["lora"][down_key], lora["lora"][alpha_key]
+        else:
+            up, down, alpha = (torch.zeros(up_shape),
+                               torch.zeros(down_shape),
+                               torch.tensor(alpha_1))
+        out.append((up, down, alpha))
+    return out
 
-    return up, down, alpha
 
-# frovenius normによるrankの計算
-def index_sv_fro(S, target):
-    S_squared = S.pow(2)
-    s_fro_sq = float(torch.sum(S_squared))
-    sum_S_squared = torch.cumsum(S_squared, dim=0)/s_fro_sq
-    index = int(torch.searchsorted(sum_S_squared, target**2)) + 1
-    index = max(1, min(index, len(S)-1))
+def scale_alphas(ups_downs_alphas):
+    up_1, down_1, alpha_1 = ups_downs_alphas[0]
+    out = []
+    for up, down, alpha in ups_downs_alphas:
+        up = up * math.sqrt(alpha / alpha_1)
+        down = down * math.sqrt(alpha / alpha_1)
+        out.append((up, down, alpha_1))
+    return out, alpha_1
 
-    return index
 
-@torch.no_grad()
-def svd_merge(up_1, down_1, up_2, down_2, rank, threshold, device=None):
-    org_device = up_1.device
-    org_dtype = up_1.dtype
+def analyse_keys(loras):
+    down_keys = set()
+    for i, lora in enumerate(loras):
+        key_count = 0
+        for key in lora["lora"].keys():
+            if ".lora_down" in key:
+                down_keys.add(key[: key.rfind(".lora_down")])
+                key_count += 1
+        print(f"LoRA {i} with {key_count} modules.")
 
-    up_1 = up_1.to(device)
-    down_1 = down_1.to(device)
-    r_1 = up_1.shape[1]
-    weight_1 = up_1.view(-1, r_1) @ down_1.view(r_1, -1)
+    print(f"Total keys to be merged {len(down_keys)} modules")
+    return down_keys
 
-    if up_2 is not None:
-        up_2 = up_2.to(device)
-        down_2 = down_2.to(device)
-        r_2 = up_2.shape[1]
-        weight_2 = up_2.view(-1, r_2) @ down_2.view(r_2, -1)
-        weight = weight_1 / r_1 + weight_2 / r_2
-    else:
-        weight = weight_1 / r_1
 
-    weight = weight.to(dtype=torch.float32) # SVD only supports float32
+def find_network_dim(lora_sd: dict):
+    network_dim = None
+    for key, value in lora_sd.items():
+        if network_dim is None and 'lora_down' in key and len(value.size()) == 2:
+            network_dim = value.size()[0]
+    return network_dim
 
-    U, S, Vh = torch.linalg.svd(weight)
 
-    if threshold < 1:
-        rank = index_sv_fro(S, threshold) + 1
+def curate_tensors(ups_downs_alphas):
+    """
+    Checks and eventually curates tensor dimensions
+    """
+    up_1, down_1, alpha_1 = ups_downs_alphas[0]
+    out = [ups_downs_alphas[0]]
+    for up, down, alpha in ups_downs_alphas[1:]:
+        up = adjust_tensor_to_match(up_1, up)
+        down = adjust_tensor_to_match(down_1, down)
+        out.append((up, down, alpha))
+    return out
 
-    U = U[:, :rank]
-    S = S[:rank]
-    U = U @ torch.diag(S)
 
-    Vh = Vh[:rank, :]
+def adjust_tensor_to_match(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Tensor:
+    """
+    Adjust tensor2 to match the shape of tensor1.
+    If tensor2 is smaller, extend it with zeros.
+    If tensor2 is larger, cut it to match the shape of tensor1.
 
-    dist = torch.cat([U.flatten(), Vh.flatten()])
-    hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-    low_val = -hi_val
+    Args:
+        tensor1 (torch.Tensor): The reference tensor with the desired shape.
+        tensor2 (torch.Tensor): The tensor to be adjusted.
 
-    U = U.clamp(low_val, hi_val)
-    Vh = Vh.clamp(low_val, hi_val)
+    Returns:
+        torch.Tensor: The adjusted tensor2 matching the shape of tensor1.
+    """
+    # Get shapes of both tensors
+    shape1 = tensor1.shape
+    shape2 = tensor2.shape
 
-    if down_1.dim() == 4:
-        U = U.reshape(up_1.shape[0], rank, 1, 1)
-        Vh = Vh.reshape(rank, down_1.shape[1], down_1.shape[2], down_1.shape[3])
+    # Determine the new shape based on the first tensor
+    new_shape = shape1
 
-    up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-    down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+    # Create a tensor of zeros with the new shape
+    adjusted_tensor = torch.zeros(new_shape, dtype=tensor2.dtype)
 
-    return up, down
+    # Determine slices for each dimension
+    slices = tuple(slice(0, min(dim1, dim2)) for dim1, dim2 in zip(shape1, shape2))
+
+    # Copy the original tensor2 into the adjusted tensor
+    adjusted_tensor[slices] = tensor2[slices]
+
+    return adjusted_tensor
