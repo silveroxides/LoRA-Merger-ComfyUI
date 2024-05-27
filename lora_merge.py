@@ -2,12 +2,13 @@ import math
 from typing import Literal
 
 import torch
-
 import comfy
-from .lora_resize import resize_lora_model
+
 from .peft_utils import task_arithmetic, ties, dare_linear, dare_ties, magnitude_prune
+from .utility import find_network_dim
 
 CLAMP_QUANTILE = 0.99
+
 
 class LoraMerger:
     """
@@ -39,8 +40,7 @@ class LoraMerger:
 
     RETURN_TYPES = ("LoRA",)
     FUNCTION = "lora_merge"
-
-    CATEGORY = "lora_merge"
+    CATEGORY = "LoRA PowerMerge"
 
     @torch.no_grad()
     def lora_merge(self, lora1,
@@ -175,8 +175,7 @@ class LoraSVDMerger:
 
     RETURN_TYPES = ("LoRA",)
     FUNCTION = "lora_svd_merge"
-
-    CATEGORY = "lora_merge"
+    CATEGORY = "LoRA PowerMerge"
 
     def lora_svd_merge(self, lora1,
                        mode: Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"] = "add_svd",
@@ -350,67 +349,6 @@ class LoraSVDMerger:
         return up_weight, down_weight, torch.tensor(module_new_rank)
 
 
-class LoraResizer:
-    def __init__(self):
-        self.loaded_lora = None
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "lora": ("LoRA",),
-                "new_rank": ("INT", {
-                    "default": 16,
-                    "min": 1,  # Minimum value
-                    "max": 320,  # Maximum value
-                    "step": 1,  # Slider's step
-                    "display": "number"  # Cosmetic only: display as "number" or "slider"
-                }),
-                "device": (["cuda", "cpu"],),
-                "dtype": (["float32", "float16", "bfloat16"],),
-            },
-        }
-
-    RETURN_TYPES = ("LoRA",)
-    FUNCTION = "lora_svd_resize"
-    CATEGORY = "lora_merge"
-
-    def lora_svd_resize(self, lora, new_rank=None, device=None, dtype=None):
-        """
-            Resize the given LoRA model to a new rank using Singular Value Decomposition (SVD).
-
-            This method adjusts the rank of the LoRA model's state dictionary by performing an SVD-based
-            resizing operation. If the current rank matches the new rank, no resizing is performed.
-            The method ensures all computations are done in `float32` to avoid precision issues.
-
-            Args:
-                lora (dict): A dictionary containing the LoRA model. The model's state dictionary should
-                    be accessible via the 'lora' key.
-                new_rank (int, optional): The desired new rank for the LoRA model. If `None`, no resizing
-                    will occur unless the current rank is different from `new_rank`.
-                device (torch.DeviceObjType, optional): The device on which to perform the computations
-                    (e.g., 'cuda' or 'cpu'). If `None`, the default device will be used.
-                dtype (torch.dtype, optional): The data type for the resized tensor. If `None`, the
-                    original data type will be retained.
-
-            Returns:
-                tuple: A tuple containing the resized LoRA model.
-
-            Note:
-                - The method internally converts tensors to `float32` for the resizing process, ensuring
-                  compatibility with the SVD operation.
-                - The resizing is skipped if the current rank matches the specified `new_rank`.
-        """
-        state_dict = lora['lora']
-        if find_network_dim(state_dict) != new_rank:
-            for key, value in state_dict.items():
-                state_dict[key] = value.to(dtype=torch.float32)  # Resize only doesn't work in half mode
-            resized, _, _ = resize_lora_model(lora_sd=state_dict, new_rank=new_rank, save_dtype=dtype, device=device,
-                                              dynamic_method=None, dynamic_param=None, verbose=False)
-            state_dict = resized
-        lora['lora'] = state_dict
-        return (lora,)
-
-
 @torch.no_grad()
 def calc_up_down_alphas(loras, key):
     """
@@ -470,14 +408,6 @@ def analyse_keys(loras):
 
     print(f"Total keys to be merged {len(down_keys)} modules")
     return down_keys
-
-
-def find_network_dim(lora_sd: dict):
-    network_dim = None
-    for key, value in lora_sd.items():
-        if network_dim is None and 'lora_down' in key and len(value.size()) == 2:
-            network_dim = value.size()[0]
-    return network_dim
 
 
 def curate_tensors(ups_downs_alphas):

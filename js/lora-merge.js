@@ -2,6 +2,39 @@ import { ComfyApp, app } from "../../scripts/app.js";
 import { ComfyDialog, $el } from "../../scripts/ui.js";
 import { api } from "../../scripts/api.js";
 
+function replaceNode(oldNode, newNodeName) {
+    const newNode = LiteGraph.createNode(newNodeName);
+    if (!newNode) {
+        return;
+    }
+    app.graph.add(newNode);
+
+    newNode.pos = oldNode.pos.slice();
+
+    // Handle the special nodes with two outputs
+    const nodesWithTwoOutputs = [];
+    let outputCount = nodesWithTwoOutputs.includes(oldNode.type) ? 2 : 1;
+
+    // Transfer output connections from old node to new node
+    oldNode.outputs.slice(0, outputCount).forEach((output, index) => {
+        if (output && output.links) {
+            output.links.forEach(link => {
+                const targetLinkInfo = oldNode.graph.links[link];
+                if (targetLinkInfo) {
+                    const targetNode = oldNode.graph.getNodeById(targetLinkInfo.target_id);
+                    if (targetNode) {
+                        newNode.connect(index, targetNode, targetLinkInfo.target_slot);
+                    }
+                }
+            });
+        }
+    });
+
+    // Remove old node
+    app.graph.remove(oldNode);
+}
+
+
 app.registerExtension({
 	name: "Comfy.LoRAMerger",
 

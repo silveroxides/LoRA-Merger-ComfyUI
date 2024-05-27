@@ -15,8 +15,7 @@ class LoraSave:
                               }}
     RETURN_TYPES = ()
     FUNCTION = "lora_save"
-
-    CATEGORY = "lora_merge"
+    CATEGORY = "LoRA PowerMerge"
 
     OUTPUT_NODE = True
 

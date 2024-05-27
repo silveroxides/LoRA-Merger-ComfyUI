@@ -10,9 +10,70 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-from .utility import index_sv_cumulative, index_sv_fro
+from .utility import index_sv_cumulative, index_sv_fro, find_network_dim
 
 MIN_SV = 1e-6
+
+
+class LoraResizer:
+    def __init__(self):
+        self.loaded_lora = None
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "lora": ("LoRA",),
+                "new_rank": ("INT", {
+                    "default": 16,
+                    "min": 1,  # Minimum value
+                    "max": 320,  # Maximum value
+                    "step": 1,  # Slider's step
+                    "display": "number"  # Cosmetic only: display as "number" or "slider"
+                }),
+                "device": (["cuda", "cpu"],),
+                "dtype": (["float32", "float16", "bfloat16"],),
+            },
+        }
+
+    RETURN_TYPES = ("LoRA",)
+    FUNCTION = "lora_svd_resize"
+    CATEGORY = "LoRA PowerMerge"
+
+    def lora_svd_resize(self, lora, new_rank=None, device=None, dtype=None):
+        """
+            Resize the given LoRA model to a new rank using Singular Value Decomposition (SVD).
+
+            This method adjusts the rank of the LoRA model's state dictionary by performing an SVD-based
+            resizing operation. If the current rank matches the new rank, no resizing is performed.
+            The method ensures all computations are done in `float32` to avoid precision issues.
+
+            Args:
+                lora (dict): A dictionary containing the LoRA model. The model's state dictionary should
+                    be accessible via the 'lora' key.
+                new_rank (int, optional): The desired new rank for the LoRA model. If `None`, no resizing
+                    will occur unless the current rank is different from `new_rank`.
+                device (torch.DeviceObjType, optional): The device on which to perform the computations
+                    (e.g., 'cuda' or 'cpu'). If `None`, the default device will be used.
+                dtype (torch.dtype, optional): The data type for the resized tensor. If `None`, the
+                    original data type will be retained.
+
+            Returns:
+                tuple: A tuple containing the resized LoRA model.
+
+            Note:
+                - The method internally converts tensors to `float32` for the resizing process, ensuring
+                  compatibility with the SVD operation.
+                - The resizing is skipped if the current rank matches the specified `new_rank`.
+        """
+        state_dict = lora['lora']
+        if find_network_dim(state_dict) != new_rank:
+            for key, value in state_dict.items():
+                state_dict[key] = value.to(dtype=torch.float32)  # Resize only doesn't work in half mode
+            resized, _, _ = resize_lora_model(lora_sd=state_dict, new_rank=new_rank, save_dtype=dtype, device=device,
+                                              dynamic_method=None, dynamic_param=None, verbose=False)
+            state_dict = resized
+        lora['lora'] = state_dict
+        return (lora,)
 
 
 def resize_lora_model(lora_sd, new_rank, save_dtype, device, dynamic_method, dynamic_param, verbose):
