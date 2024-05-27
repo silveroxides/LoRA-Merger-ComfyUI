@@ -4,11 +4,11 @@ from typing import Literal, get_args
 import torch
 import comfy
 
-from .peft_utils import task_arithmetic, ties, dare_linear, dare_ties, magnitude_prune
-from .utility import find_network_dim
+from .peft_utils import task_arithmetic, ties, dare_linear, dare_ties, magnitude_prune, concat
+from .utility import find_network_dim, to_dtype
 
 CLAMP_QUANTILE = 0.99
-MODES = Literal["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"]
+MODES = Literal["add", "concat", "ties", "dare_linear", "dare_ties", "magnitude_prune"]
 SVD_MODES = Literal["add_svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"]
 
 
@@ -51,13 +51,13 @@ class LoraMerger:
         """
             Merge multiple LoRA models using the specified mode.
 
-            This method merges the given LoRA models according to the specified mode, such as 'add', 'ties',
+            This method merges the given LoRA models according to the specified mode, such as 'add', 'concat', 'ties',
             'dare_linear', 'dare_ties', or 'magnitude_prune'. The merging process considers the up and down
             projection matrices and their respective alpha values.
 
             Args:
                 lora1 (dict): The first LoRA model to merge.
-                mode (str, optional): The merging mode to use. Options include 'add', 'ties', 'dare_linear',
+                mode (str, optional): The merging mode to use. Options include 'add', 'concat', 'ties', 'dare_linear',
                     'dare_ties', and 'magnitude_prune'. Default is None.
                 density (float, optional): The density parameter used for some merging modes.
                 device (torch.DeviceObjType, optional): The device to use for computations (e.g., 'cuda' or 'cpu').
@@ -78,7 +78,7 @@ class LoraMerger:
 
         self.validate_input(loras, mode)
 
-        dtype = self.to_dtype(dtype)
+        dtype = to_dtype(dtype)
         keys = analyse_keys(loras)
         weight = {}
 
@@ -96,7 +96,7 @@ class LoraMerger:
             ups_downs_alphas, alpha_1 = scale_alphas(ups_downs_alphas)
 
             # Assure that dimensions are equal in every tensor of the same layer
-            ups_downs_alphas = curate_tensors(ups_downs_alphas)
+            # ups_downs_alphas = curate_tensors(ups_downs_alphas)
 
             up_tensors = [up.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
             down_tensors = [down.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
@@ -104,6 +104,9 @@ class LoraMerger:
             if mode == "add":
                 up, down = (task_arithmetic(up_tensors, weights),
                             task_arithmetic(down_tensors, weights))
+            elif mode == "concat":
+                up, down = (concat(up_tensors, weights, dim=1),
+                            concat(down_tensors, weights, dim=0))
             elif mode == "ties":
                 up, down = (ties(up_tensors, weights, density),
                             ties(down_tensors, weights, density))
@@ -125,15 +128,6 @@ class LoraMerger:
 
         lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1}
         return (lora_out,)
-
-    def to_dtype(self, dtype):
-        dtype_mapping = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16
-        }
-        dtype = dtype_mapping.get(dtype, torch.float32)
-        return dtype
 
     def validate_input(self, loras, mode):
         dims = [find_network_dim(lora['lora']) for lora in loras]
@@ -206,6 +200,7 @@ class LoraSVDMerger:
         loras = [lora1]
         for k, v in kwargs.items():
             loras.append(v)
+        dtype = to_dtype(dtype)
 
         self.validate_input(loras, mode)
 
@@ -219,7 +214,7 @@ class LoraSVDMerger:
             strengths = torch.tensor([w[strength_key] for w in loras]).to(device)
 
             # Calculate up and down nets and their alphas
-            ups_downs_alphas = calc_up_down_alphas(loras, key)
+            ups_downs_alphas = calc_up_down_alphas(loras, key, fill_with_empty_tensor=True)
 
             # Build merged tensor
             weights = self.build_weights(ups_downs_alphas, strengths, mode, density, device)
@@ -227,9 +222,9 @@ class LoraSVDMerger:
             # Calculate final tensors by svd
             up, down, alpha = self.svd(weights, svd_rank, svd_conv_rank, device)
 
-            weight[key + ".lora_up.weight"] = up.to('cpu', dtype=dtype)
-            weight[key + ".lora_down.weight"] = down.to('cpu', dtype=dtype)
-            weight[key + ".alpha"] = alpha.to('cpu', dtype=dtype)
+            weight[key + ".lora_up.weight"] = up.to(device='cpu', dtype=dtype)
+            weight[key + ".lora_down.weight"] = down.to(device='cpu', dtype=dtype)
+            weight[key + ".alpha"] = alpha.to(device='cpu', dtype=dtype)
 
             pb.update(1)
 
@@ -364,7 +359,7 @@ class LoraSVDMerger:
 
 
 @torch.no_grad()
-def calc_up_down_alphas(loras, key):
+def calc_up_down_alphas(loras, key, fill_with_empty_tensor=False):
     """
        Calculate up, down tensors and alphas for a given key.
 
@@ -392,11 +387,12 @@ def calc_up_down_alphas(loras, key):
     for lora in loras:
         if lora in owners:
             up, down, alpha = lora["lora"][up_key], lora["lora"][down_key], lora["lora"][alpha_key]
-        else:
+            out.append((up, down, alpha))
+        elif fill_with_empty_tensor:
             up, down, alpha = (torch.zeros(up_shape),
                                torch.zeros(down_shape),
                                torch.tensor(alpha_1))
-        out.append((up, down, alpha))
+            out.append((up, down, alpha))
     return out
 
 
@@ -422,48 +418,3 @@ def analyse_keys(loras):
 
     print(f"Total keys to be merged {len(down_keys)} modules")
     return down_keys
-
-
-def curate_tensors(ups_downs_alphas):
-    """
-    Checks and eventually curates tensor dimensions
-    """
-    up_1, down_1, alpha_1 = ups_downs_alphas[0]
-    out = [ups_downs_alphas[0]]
-    for up, down, alpha in ups_downs_alphas[1:]:
-        up = adjust_tensor_to_match(up_1, up)
-        down = adjust_tensor_to_match(down_1, down)
-        out.append((up, down, alpha))
-    return out
-
-
-def adjust_tensor_to_match(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Tensor:
-    """
-    Adjust tensor2 to match the shape of tensor1.
-    If tensor2 is smaller, extend it with zeros.
-    If tensor2 is larger, cut it to match the shape of tensor1.
-
-    Args:
-        tensor1 (torch.Tensor): The reference tensor with the desired shape.
-        tensor2 (torch.Tensor): The tensor to be adjusted.
-
-    Returns:
-        torch.Tensor: The adjusted tensor2 matching the shape of tensor1.
-    """
-    # Get shapes of both tensors
-    shape1 = tensor1.shape
-    shape2 = tensor2.shape
-
-    # Determine the new shape based on the first tensor
-    new_shape = shape1
-
-    # Create a tensor of zeros with the new shape
-    adjusted_tensor = torch.zeros(new_shape, dtype=tensor2.dtype)
-
-    # Determine slices for each dimension
-    slices = tuple(slice(0, min(dim1, dim2)) for dim1, dim2 in zip(shape1, shape2))
-
-    # Copy the original tensor2 into the adjusted tensor
-    adjusted_tensor[slices] = tensor2[slices]
-
-    return adjusted_tensor

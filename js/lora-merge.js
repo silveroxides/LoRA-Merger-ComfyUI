@@ -39,7 +39,7 @@ app.registerExtension({
 	name: "Comfy.LoRAMerger",
 
 	async beforeRegisterNodeDef(nodeType, nodeData, app) {
-		if (nodeData.name === 'LoraMerger' || nodeData.name === 'LoraSVDMerger')  {
+		if (nodeData.name === 'PM LoRA Merger' || nodeData.name === 'PM LoRA SVD Merger')  {
 			var input_name = "lora";
 
 			const onConnectionsChange = nodeType.prototype.onConnectionsChange;

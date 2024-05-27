@@ -26,3 +26,13 @@ def index_sv_fro(S, target):
     index = max(1, min(index, len(S) - 1))
 
     return index
+
+
+def to_dtype(dtype):
+    dtype_mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16
+    }
+    dtype = dtype_mapping.get(dtype, torch.float32)
+    return dtype

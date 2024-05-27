@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import math
 import warnings
 from typing import List, Literal
 
@@ -266,3 +266,17 @@ def dare_ties(
     # Disjoint Merge
     mixed_task_tensors = disjoint_merge(weighted_task_tensors, majority_sign_mask)
     return mixed_task_tensors
+
+
+def concat(tensors: list[torch.Tensor], weights: torch.Tensor, dim):
+    if not tensors:
+        raise ValueError("The list of tensors must not be empty.")
+
+    total_features = sum(tensor.shape[1] for tensor in tensors)
+    scaled_tensors = []
+    for t, tensor in enumerate(tensors):
+        r_t = tensor.shape[1]
+        scale = math.sqrt(total_features / r_t)
+        scaled_tensors.append(tensor * scale * weights[t])
+
+    return torch.cat(scaled_tensors, dim=dim)
