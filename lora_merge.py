@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
 import comfy
@@ -8,6 +8,8 @@ from .peft_utils import task_arithmetic, ties, dare_linear, dare_ties, magnitude
 from .utility import find_network_dim
 
 CLAMP_QUANTILE = 0.99
+MODES = Literal["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"]
+SVD_MODES = Literal["add_svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"]
 
 
 class LoraMerger:
@@ -26,7 +28,7 @@ class LoraMerger:
         return {
             "required": {
                 "lora1": ("LoRA",),
-                "mode": (["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"],),
+                "mode": (get_args(MODES),),
                 "density": ("FLOAT", {
                     "default": 1.0,
                     "min": 0,
@@ -44,7 +46,7 @@ class LoraMerger:
 
     @torch.no_grad()
     def lora_merge(self, lora1,
-                   mode: Literal["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"] = None,
+                   mode: MODES = None,
                    density=None, device=None, dtype=None, **kwargs):
         """
             Merge multiple LoRA models using the specified mode.
@@ -74,7 +76,7 @@ class LoraMerger:
         for k, v in kwargs.items():
             loras.append(v)
 
-        self.validate_input(loras)
+        self.validate_input(loras, mode)
 
         dtype = self.to_dtype(dtype)
         keys = analyse_keys(loras)
@@ -133,22 +135,25 @@ class LoraMerger:
         dtype = dtype_mapping.get(dtype, torch.float32)
         return dtype
 
-    def validate_input(self, loras):
+    def validate_input(self, loras, mode):
         dims = [find_network_dim(lora['lora']) for lora in loras]
         if min(dims) != max(dims):
             raise Exception("LoRAs with different ranks not allowed in LoraMerger. Use SVD merge.")
+        if mode not in get_args(MODES):
+            raise Exception(f"Invalid / unsupported mode {mode}")
 
 
 class LoraSVDMerger:
     """
         Class for merging LoRA models using Singular Value Decomposition (SVD).
     """
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "lora1": ("LoRA",),
-                "mode": (["add_svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"],),
+                "mode": (get_args(SVD_MODES),),
                 "density": ("FLOAT", {
                     "default": 1.0,
                     "min": 0,
@@ -170,6 +175,7 @@ class LoraSVDMerger:
                     "display": "number"
                 }),
                 "device": (["cuda", "cpu"],),
+                "dtype": (["float32", "float16", "bfloat16"],),
             },
         }
 
@@ -178,8 +184,9 @@ class LoraSVDMerger:
     CATEGORY = "LoRA PowerMerge"
 
     def lora_svd_merge(self, lora1,
-                       mode: Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"] = "add_svd",
-                       density: float = None, svd_rank: int = None, svd_conv_rank: int = None, device=None, **kwargs):
+                       mode: SVD_MODES = "add_svd",
+                       density: float = None, svd_rank: int = None, svd_conv_rank: int = None, device=None, dtype=None,
+                       **kwargs):
         """
            Merge LoRA models using SVD and specified mode.
 
@@ -190,6 +197,7 @@ class LoraSVDMerger:
                svd_rank: The rank for SVD.
                svd_conv_rank: The convolution rank for SVD.
                device: The device to use ('cuda' or 'cpu').
+               dtype: The data type for output
                **kwargs: Additional LoRA models to merge.
 
            Returns:
@@ -198,6 +206,8 @@ class LoraSVDMerger:
         loras = [lora1]
         for k, v in kwargs.items():
             loras.append(v)
+
+        self.validate_input(loras, mode)
 
         weight = {}
         keys = analyse_keys(loras)
@@ -217,17 +227,21 @@ class LoraSVDMerger:
             # Calculate final tensors by svd
             up, down, alpha = self.svd(weights, svd_rank, svd_conv_rank, device)
 
-            weight[key + ".lora_up.weight"] = up.to('cpu', dtype=torch.float32)
-            weight[key + ".lora_down.weight"] = down.to('cpu', dtype=torch.float32)
-            weight[key + ".alpha"] = alpha.to('cpu', dtype=torch.float32)
+            weight[key + ".lora_up.weight"] = up.to('cpu', dtype=dtype)
+            weight[key + ".lora_down.weight"] = down.to('cpu', dtype=dtype)
+            weight[key + ".alpha"] = alpha.to('cpu', dtype=dtype)
 
             pb.update(1)
 
         lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1}
         return (lora_out,)
 
+    def validate_input(self, loras, mode):
+        if mode not in get_args(SVD_MODES):
+            raise Exception(f"Invalid / unsupported mode {mode}")
+
     def build_weights(self, ups_downs_alphas, strengths,
-                      mode: Literal["svd", "ties_svd", "dare_linear_svd", "dare_ties_svd", "magnitude_prune_svd"], density, device):
+                      mode: SVD_MODES, density, device):
         """
             Construct the combined weight tensor from multiple LoRA up and down tensors using different
             merging modes.
@@ -263,7 +277,8 @@ class LoraSVDMerger:
             rank = up.shape[1]
             if conv2d:
                 if kernel_size == (1, 1):
-                    weight = (up.squeeze(3).squeeze(2) @ down.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3) * alpha / rank
+                    weight = (up.squeeze(3).squeeze(2) @ down.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(
+                        3) * alpha / rank
                 else:
                     weight = torch.nn.functional.conv2d(down.permute(1, 0, 2, 3), up).permute(1, 0, 2, 3) * alpha / rank
             else:  # linear
@@ -282,7 +297,6 @@ class LoraSVDMerger:
             weight = magnitude_prune(weights, strengths, density)
 
         return weight
-
 
     def svd(self, weights: torch.Tensor, svd_rank: int, svd_conv_rank: int, device: torch.DeviceObjType):
         """

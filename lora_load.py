@@ -66,8 +66,6 @@ MID_ID = {26: 13, 20: 10}
 
 
 class LoraPowerMergeLoader:
-    modes = ["LoRA Name", "LoRA Name+Weights"]
-
     def __init__(self):
         self.loaded_lora = None
         self.lbw = None
@@ -76,7 +74,6 @@ class LoraPowerMergeLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "input_mode": (cls.modes,),
                 "lora_name": (folder_paths.get_filename_list("loras"),),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
@@ -91,8 +88,9 @@ class LoraPowerMergeLoader:
     FUNCTION = "load_lora"
     CATEGORY = "LoRA PowerMerge"
 
-    def load_lora(self, input_mode, lora_name, strength_model, strength_clip, lbw):
+    def load_lora(self, lora_name, strength_model, strength_clip, lbw):
         lora_path = folder_paths.get_full_path("loras", lora_name)
+        lora_name_pretty = os.path.splitext(lora_name)[0]
         lora = None
 
         if self.loaded_lora is not None:
@@ -106,7 +104,7 @@ class LoraPowerMergeLoader:
         if lora is None or self.lbw != lbw:
             lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
-            if input_mode == "LoRA Name+Weights" and lbw != "":
+            if lbw != "":
                 weight_list = parse_weight_list(lbw)
                 print(f"{lora_name} block weight is :{weight_list}")
                 weight_list = expand_lbw(weight_list)
@@ -149,5 +147,6 @@ class LoraPowerMergeLoader:
             self.lbw = lbw
 
         return ({"lora": lora,
-                 "strength_model": strength_model if input_mode == "LoRA Names+Weight" else 1,
-                 "strength_clip": strength_clip if  input_mode == "LoRA Names+Weight" else 0},)
+                 "strength_model": strength_model,
+                 "strength_clip": strength_clip,
+                 "name": lora_name_pretty},)
