@@ -96,7 +96,7 @@ class LoraMerger:
             ups_downs_alphas, alpha_1 = scale_alphas(ups_downs_alphas)
 
             # Assure that dimensions are equal in every tensor of the same layer
-            # ups_downs_alphas = curate_tensors(ups_downs_alphas)
+            ups_downs_alphas = curate_tensors(ups_downs_alphas)
 
             up_tensors = [up.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
             down_tensors = [down.to(device, dtype=dtype) for up, down, alpha in ups_downs_alphas]
@@ -366,6 +366,7 @@ def calc_up_down_alphas(loras, key, fill_with_empty_tensor=False):
        Args:
            loras: List of LoRA models.
            key: The key to calculate values for.
+           fill_with_empty_tensor=False: create a zero tensor in the case of a LoRA doesn't contain the key
 
        Returns:
            List of tuples containing up, down tensors and alpha values.
@@ -418,3 +419,48 @@ def analyse_keys(loras):
 
     print(f"Total keys to be merged {len(down_keys)} modules")
     return down_keys
+
+
+def curate_tensors(ups_downs_alphas):
+    """
+    Checks and eventually curates tensor dimensions
+    """
+    up_1, down_1, alpha_1 = ups_downs_alphas[0]
+    out = [ups_downs_alphas[0]]
+    for up, down, alpha in ups_downs_alphas[1:]:
+        up = adjust_tensor_to_match(up_1, up)
+        down = adjust_tensor_to_match(down_1, down)
+        out.append((up, down, alpha))
+    return out
+
+
+def adjust_tensor_to_match(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Tensor:
+    """
+    Adjust tensor2 to match the shape of tensor1.
+    If tensor2 is smaller, extend it with zeros.
+    If tensor2 is larger, cut it to match the shape of tensor1.
+
+    Args:
+        tensor1 (torch.Tensor): The reference tensor with the desired shape.
+        tensor2 (torch.Tensor): The tensor to be adjusted.
+
+    Returns:
+        torch.Tensor: The adjusted tensor2 matching the shape of tensor1.
+    """
+    # Get shapes of both tensors
+    shape1 = tensor1.shape
+    shape2 = tensor2.shape
+
+    # Determine the new shape based on the first tensor
+    new_shape = shape1
+
+    # Create a tensor of zeros with the new shape
+    adjusted_tensor = torch.zeros(new_shape, dtype=tensor2.dtype)
+
+    # Determine slices for each dimension
+    slices = tuple(slice(0, min(dim1, dim2)) for dim1, dim2 in zip(shape1, shape2))
+
+    # Copy the original tensor2 into the adjusted tensor
+    adjusted_tensor[slices] = tensor2[slices]
+
+    return adjusted_tensor
