@@ -1,6 +1,8 @@
 # LoRA Power-Merger ComfyUI
 Full power on LoRA merge operations and their evaluation including dare merge, SVD support and XY plots. 
 
+![mergers.png](assets/mergers.png)
+
 This is a fork and updated version of laksjdjf [LoRA Merger](https://github.com/laksjdjf/LoRA-Merger-ComfyUI)
 Merging algorithms (ties, dare, magnitude pruning) are taken from [PEFT](https://github.com/huggingface/peft). XY plots require [efficiency nodes](https://github.com/jags111/efficiency-nodes-comfyui/).
 
@@ -118,3 +120,8 @@ of different combinations on a neural network model.
 - `rank_steps`: Number of density ranks to generate
 - `device`: The device to use ('cuda' or 'cpu').
 - `dtype`: The data type for computations ('float32', 'float16', 'bfloat16').
+
+### Exemplary usage with efficiency nodes
+Use XY inputs with Efficiency Loader and Efficiency KSampler.
+
+![xy-efficieny-setup.png](assets/xy-efficieny-setup.png)
