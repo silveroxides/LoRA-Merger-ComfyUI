@@ -5,7 +5,7 @@ from .lora_resize import LoraResizer
 from .lora_merge_xy import XYInputPowerMergeStrengths, XYInputPowerMergeModes, XYInputPowerMergeSVD
 from .lora_save import LoraSave
 
-version_code = [0, 10]
+version_code = [0, 11]
 version_str = f"V{version_code[0]}.{version_code[1]}" + (f'.{version_code[2]}' if len(version_code) > 2 else '')
 print(f"### Loading: ComfyUI LoRA-PowerMerge ({version_str})")
 
