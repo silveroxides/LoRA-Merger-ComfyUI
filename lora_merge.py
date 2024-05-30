@@ -384,9 +384,10 @@ def calc_up_down_alphas(loras, key, fill_with_empty_tensor=False):
     # Determine alpha from the first lora which contains the module
     alpha_1 = owners[0]["lora"][alpha_key]
 
+    owner_names = [l["name"] for l in owners]
     out = []
     for lora in loras:
-        if lora in owners:
+        if lora['name'] in owner_names:
             up, down, alpha = lora["lora"][up_key], lora["lora"][down_key], lora["lora"][alpha_key]
             out.append((up, down, alpha))
         elif fill_with_empty_tensor:

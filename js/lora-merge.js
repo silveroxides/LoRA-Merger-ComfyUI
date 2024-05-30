@@ -1,33 +1,5 @@
 import {app} from "../../scripts/app.js";
 
-function replaceNode(oldNode, newNodeName) {
-    const newNode = LiteGraph.createNode(newNodeName);
-    if (!newNode) {
-        return;
-    }
-    app.graph.add(newNode);
-
-    newNode.pos = oldNode.pos.slice();
-
-    // Transfer output connections from old node to new node
-    oldNode.outputs.slice(0, outputCount).forEach((output, index) => {
-        if (output && output.links) {
-            output.links.forEach(link => {
-                const targetLinkInfo = oldNode.graph.links[link];
-                if (targetLinkInfo) {
-                    const targetNode = oldNode.graph.getNodeById(targetLinkInfo.target_id);
-                    if (targetNode) {
-                        newNode.connect(index, targetNode, targetLinkInfo.target_slot);
-                    }
-                }
-            });
-        }
-    });
-
-    // Remove old node
-    app.graph.remove(oldNode);
-}
-
 
 app.registerExtension({
     name: "Comfy.LoRAMerger",
