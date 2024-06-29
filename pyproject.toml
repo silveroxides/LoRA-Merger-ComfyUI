@@ -9,6 +9,6 @@ Repository = "https://github.com/larsupb/LoRA-Merger-ComfyUI"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "larsupb"
 DisplayName = "LoRA-Merger-ComfyUI"
 Icon = ""
