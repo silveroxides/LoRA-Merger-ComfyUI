@@ -126,7 +126,8 @@ class LoraMerger:
 
             pbar.update(1)
 
-        lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1}
+        lora_out = {"lora": weight, "strength_model": 1, "strength_clip": 1,
+                    "name": "merged_of_" + "_".join([l['name'] for l in loras])}
         return (lora_out,)
 
     def validate_input(self, loras, mode):
@@ -293,7 +294,7 @@ class LoraSVDMerger:
 
         return weight
 
-    def svd(self, weights: torch.Tensor, svd_rank: int, svd_conv_rank: int, device: torch.DeviceObjType):
+    def svd(self, weights: torch.Tensor, svd_rank: int, svd_conv_rank: int, device: str):
         """
             Perform Singular Value Decomposition (SVD) on the given weights tensor and return the
             decomposed matrices with the specified ranks.

@@ -54,7 +54,7 @@ class XYInputPowerMergeStrengths:
             "required": {
                 "lora_a": (folder_paths.get_filename_list("loras"),),
                 "lora_b": (folder_paths.get_filename_list("loras"),),
-                "mode": (["add", "ties", "dare_linear", "dare_ties", "magnitude_prune"],),
+                "mode": (["add", "concat", "ties", "dare_linear", "dare_ties", "magnitude_prune"],),
                 "density": ("FLOAT", {
                     "default": 1.0,
                     "min": 0,
@@ -123,7 +123,7 @@ class XYInputPowerMergeModes:
             "required": {
                 "lora_a": ("LoRA",),
                 "lora_b": ("LoRA",),
-                "modes": ("STRING", {"multiline": True, "default": "add, ties, dare_linear, dare_ties, magnitude_prune",
+                "modes": ("STRING", {"multiline": True, "default": "add, concat, ties, dare_linear, dare_ties, magnitude_prune",
                                      "placeholder": "modes", "pysssss.autocomplete": False}),
                 "min_density": ("FLOAT", {"default": 0, "min": -0.0, "max": 1.0, "step": 0.01}),
                 "max_density": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
